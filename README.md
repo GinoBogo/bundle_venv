@@ -143,4 +143,3 @@ Gino Bogo
 ## License
 
 MIT. See LICENSE.
-```
