@@ -10,6 +10,24 @@ base Python, bundles non-system shared library dependencies, and can build
 a tarball or a single-file self-extracting installer. It is a Bash script
 for Linux.
 
+## Why not copy the venv directly?
+
+A Python virtual environment is not normally portable. Copying it unchanged to
+another machine or path usually fails because:
+
+- It stores **absolute paths** (for example `pyvenv.cfg` `home=`, interpreter
+  symlinks, shebang lines in scripts, and `sysconfig`/`.pth` data).
+- It depends on the **original Python installation** and may break if that
+  version or location is absent on the target.
+- It can rely on **machine-specific or unbundled shared libraries**, so missing
+  dependencies cause runtime errors.
+- Moving it to a new location can leave stale paths behind, causing imports,
+  module resolution, or command execution to fail.
+
+`bundle_venv.sh` avoids these problems by rewriting paths, embedding the base
+Python when requested, collecting required runtime libraries, and producing a
+fixed-up environment that can be deployed or relocated reliably.
+
 ## Features
 
 - Detects the original venv path from `pyvenv.cfg`.
