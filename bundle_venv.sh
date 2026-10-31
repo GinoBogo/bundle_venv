@@ -32,6 +32,7 @@ FORCE=false
 QUIET=false
 KEEP_PYCACHE=false
 EMBED_MODE="auto" # auto | force | skip
+RE_EMBED=false
 NO_STDLIB=false
 NO_LIBPYTHON=false
 NO_PATCHELF=false
@@ -159,6 +160,7 @@ print_usage() {
     echo
     echo -e "  ${GREEN}--embed${RESET}                Force embedding of the base Python"
     echo -e "  ${GREEN}--no-embed${RESET}             Skip embedding (just fix paths; run on target)"
+    echo -e "  ${GREEN}--re-embed${RESET}             Rebuild an existing embedded Python (implies --embed)"
     echo -e "  ${GREEN}--base-python DIR${RESET}      Override base Python prefix detection"
     echo -e "  ${GREEN}--no-stdlib${RESET}            Don't copy the stdlib when embedding"
     echo -e "  ${GREEN}--no-libpython${RESET}         Don't copy libpython*.so when embedding"
@@ -304,6 +306,12 @@ while (($#)); do
             EMBED_MODE="skip"
             shift
             ;;
+        --re-embed)
+            EMBED_MODE="force"
+            RE_EMBED=true
+            shift
+            ;;
+
         --base-python)
             if [[ $# -lt 2 ]]; then
                 log_err "missing argument for $1"
@@ -424,6 +432,10 @@ fi
 # ==============================================================================
 
 # Locate the virtual environment directory.
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    log_warn "Bash 4.4 or newer is recommended; empty-array behavior may differ"
+fi
 if [[ -n "$VENV_ARG" ]]; then
     VENV_PATH="$VENV_ARG"
 else
@@ -459,41 +471,51 @@ log_info "target path:     $NEW_PATH"
 detect_original_venv() {
     local venv="$1" p="" raw=""
 
-    # Check pyvenv.cfg for the creation command.
-    #
-    # The command is stored verbatim, so flags such as --copies,
-    # --system-site-packages, --prompt X, --clear or --upgrade may sit
-    # between "venv" and the env directory. The env directory is always
-    # the final whitespace-separated token, so take the last token and
-    # reject anything that still looks like an option flag.
+    # Prefer bin/activate: it contains the full recorded path, including paths
+    # that contain spaces, whereas pyvenv.cfg stores the command unquoted.
+    if [[ -f "$venv/bin/activate" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == *VIRTUAL_ENV=* ]] || continue
+            p="${line#*VIRTUAL_ENV=}"
+            p="${p#"${p%%[![:space:]]*}"}"
+            p="${p%"${p##*[![:space:]]}"}"
+            if [[ "$p" == \"*\" ]]; then
+                p="${p:1:${#p}-2}"
+            elif [[ "$p" == \'*\' ]]; then
+                p="${p:1:${#p}-2}"
+            else
+                continue
+            fi
+            if [[ -n "$p" && "$p" != "$venv" ]]; then
+                printf '%s' "$p"
+                return 0
+            fi
+        done < "$venv/bin/activate"
+    fi
+
+    # Check pyvenv.cfg for the creation command. The env directory is usually
+    # the final whitespace-separated token, but that is only reliable when the
+    # recorded path does not contain spaces. Reject spaced fragments and let the
+    # other detectors handle those venvs.
     if [[ -f "$venv/pyvenv.cfg" ]]; then
-        raw=$(sed -n 's|^[[:space:]]*command[[:space:]]*=[[:space:]]*||p' \
-            "$venv/pyvenv.cfg" | tail -n1)
+        raw=$(sed -n 's|^[[:space:]]*command[[:space:]]*=[[:space:]]*||p'             "$venv/pyvenv.cfg" | tail -n1)
         if [[ -n "$raw" ]]; then
             p="${raw##* }"
             # Strip surrounding quotes if the path was quoted.
             p="${p%\"}"
             p="${p#\"}"
+            p="${p%'}"
+            p="${p#'}"
             if [[ -n "$p" && "$p" != -* && "$p" != "$venv" ]]; then
-                # On the source machine the path exists; on the target it
-                # may not, so accept any path-like token containing a slash.
-                if [[ -d "$p" || "$p" == /* || "$p" == ./* || "$p" == ../* || "$p" == */* ]]; then
-                    printf '%s' "$p"
-                    return 0
+                # A spaced original path cannot be recovered reliably from this
+                # token, so only accept tokens that look like whole paths.
+                if [[ "$p" == /* || "$p" == ./* || "$p" == ../* || "$p" == */* ]]; then
+                    if [[ "$p" != *[[:space:]]* ]]; then
+                        printf '%s' "$p"
+                        return 0
+                    fi
                 fi
             fi
-        fi
-    fi
-
-    # Check bin/activate for the VIRTUAL_ENV variable.
-    # (No -d requirement: on the target this path will not exist yet, and
-    # that is precisely what we want to rewrite.)
-    if [[ -f "$venv/bin/activate" ]]; then
-        p=$(sed -n 's|^[[:space:]]*VIRTUAL_ENV="\(.*\)"[[:space:]]*$|\1|p' \
-            "$venv/bin/activate" | tail -n1)
-        if [[ -n "$p" && "$p" != "$venv" ]]; then
-            printf '%s' "$p"
-            return 0
         fi
     fi
 
@@ -504,9 +526,13 @@ detect_original_venv() {
             [[ -L "$f" ]] && continue
             IFS= read -r first < "$f" 2> /dev/null || continue
             [[ "$first" == '#!'* ]] || continue
-            p="${first#\#!}"
-            p="${p%% *}"
-            p="${p%/bin/python*}"
+            first="${first#\#!}"
+            if [[ "$first" =~ ^[[:space:]]*(.*)/bin/python ]]; then
+                p="${BASH_REMATCH[1]}"
+            else
+                p="${first%% *}"
+                p="${p%/bin/python*}"
+            fi
             if [[ -n "$p" && "$p" != "$venv" && ! -e "$p" ]]; then
                 printf '%s' "$p"
                 return 0
@@ -542,12 +568,23 @@ read_recorded_path() {
     fi
 
     if [[ -f "$venv/bin/activate" ]]; then
-        p=$(sed -n 's|^[[:space:]]*VIRTUAL_ENV="\(.*\)"[[:space:]]*$|\1|p' \
-            "$venv/bin/activate" | tail -n1)
-        if [[ -n "$p" ]]; then
-            printf '%s' "$p"
-            return 0
-        fi
+        while IFS= read -r line; do
+            [[ "$line" == *VIRTUAL_ENV=* ]] || continue
+            p="${line#*VIRTUAL_ENV=}"
+            p="${p#"${p%%[![:space:]]*}"}"
+            p="${p%"${p##*[![:space:]]}"}"
+            if [[ "$p" == \"*\" ]]; then
+                p="${p:1:${#p}-2}"
+            elif [[ "$p" == \'*\' ]]; then
+                p="${p:1:${#p}-2}"
+            else
+                continue
+            fi
+            if [[ -n "$p" ]]; then
+                printf '%s' "$p"
+                return 0
+            fi
+        done < "$venv/bin/activate"
     fi
 
     return 1
@@ -577,14 +614,30 @@ fi
 # Description: Locates the base Python installation prefix.
 # Arguments: $1 - path to the venv directory.
 detect_base_python() {
-    local venv="$1" home="" x=""
+    local venv="$1" home="" x="" exe=""
     if [[ -n "$BASE_PYTHON_ARG" ]]; then
         printf '%s' "$BASE_PYTHON_ARG"
         return 0
     fi
     if [[ -f "$venv/pyvenv.cfg" ]]; then
         home=$(sed -n 's|^[[:space:]]*home[[:space:]]*=[[:space:]]*||p' "$venv/pyvenv.cfg" | head -n1)
+        exe=$(sed -n 's|^[[:space:]]*executable[[:space:]]*=[[:space:]]*||p' "$venv/pyvenv.cfg" | head -n1)
     fi
+
+    # When re-embedding, or when the recorded home is the embedded copy, the
+    # original interpreter prefix is unavailable after removal. Fall back to
+    # executable=, which normally still points at the source interpreter.
+    if [[ "$RE_EMBED" == true || "$home" == "$venv/.python"* ]]; then
+        if [[ -n "$exe" ]]; then
+            x="$(dirname "$(dirname "$exe")")"
+            [[ "$(basename "$x")" == "bin" ]] && x="$(dirname "$x")"
+            if [[ -d "$x/lib/python$PYVER" || -d "$x/lib64/python$PYVER" ]]; then
+                printf '%s' "$x"
+                return 0
+            fi
+        fi
+    fi
+
     [[ -z "$home" ]] && return 1
     x="$home"
     [[ "$(basename "$x")" == "bin" ]] && x="$(dirname "$x")"
@@ -649,8 +702,10 @@ EMBED_DIR="$VENV_PATH/.python"
 should_embed() {
     # Explicit skip.
     [[ "$EMBED_MODE" == "skip" ]] && return 1
-    # Already embedded — never re-embed, even in force mode.
-    [[ -d "$EMBED_DIR/lib/python$PYVER" ]] && return 1
+    # Already embedded — never re-embed, unless explicitly requested.
+    if [[ "$RE_EMBED" != true && -d "$EMBED_DIR/lib/python$PYVER" ]]; then
+        return 1
+    fi
     # Force: caller has already validated that a usable base Python exists.
     [[ "$EMBED_MODE" == "force" ]] && return 0
     # Auto: embed iff a validated base Python is available.
@@ -1218,14 +1273,20 @@ resolve_included_libs() {
 # Arguments: (none)
 bundle_runtime_libs() {
     log_info "collecting runtime dependencies..."
+    local have_ldd=false
+    if command -v ldd >/dev/null 2>&1; then
+        have_ldd=true
+    else
+        log_warn "ldd not found; dynamic dependency scanning is unavailable"
+    fi
     local -a all_elfs=()
     mapfile -t all_elfs < <(find_all_venv_elfs)
-    if ((${#all_elfs[@]} > 0)); then
+    if $have_ldd && ((${#all_elfs[@]} > 0)); then
         collect_runtime_deps "${all_elfs[@]}"
     fi
     if ((${#INCLUDE_LIBS[@]} > 0)); then
         resolve_included_libs
-        if ((${#INCLUDE_EXTRA_ELFS[@]} > 0)); then
+        if $have_ldd && ((${#INCLUDE_EXTRA_ELFS[@]} > 0)); then
             collect_runtime_deps "${INCLUDE_EXTRA_ELFS[@]}"
         fi
     fi
@@ -1277,6 +1338,14 @@ embed_base_python() {
         log_warn "no base Python to embed"
         return 1
     }
+    if $RE_EMBED && [[ -d "$EMBED_DIR" ]]; then
+        if $DRY_RUN; then
+            log_test "would: rm -rf $EMBED_DIR"
+        else
+            log_info "removing previous embedded Python: $EMBED_DIR"
+            rm -rf -- "$EMBED_DIR"
+        fi
+    fi
     log_info "embedding base Python into $EMBED_DIR"
     if ! $DRY_RUN; then
         mkdir -p "$EMBED_DIR/bin" "$EMBED_DIR/lib"
@@ -1343,7 +1412,7 @@ rewrite_path() {
     fi
 
     if $HAVE_PERL; then
-        if OLD="$old" NEW="$new" perl -pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' "$file"; then
+        if OLD="$old" NEW="$new" perl -pi -e 's/\Q$ENV{OLD}\E(?=[\/\s"\x27<>()[\]{}:,;]|$)/$ENV{NEW}/g' "$file"; then
             log_info "rewrote path in: $file"
             CHANGE_COUNT=$((CHANGE_COUNT + 1))
         else
@@ -1365,9 +1434,17 @@ rewrite_path() {
         local n="${new//\\/\\\\}"
         n="${n//&/\\&}"
         n="${n//|/\\|}"
-        local tmp
-        tmp=$(mktemp "${file}.XXXXXX")
-        if sed "s|$o|$n|g" "$file" > "$tmp"; then
+        # The fallback runs only without Perl and therefore cannot use
+        # lookaround assertions. Apply the replacement only at path-friendly
+        # boundaries by checking each allowed boundary character separately;
+        # this keeps sibling names such as OLD_backup intact.
+        local tmp sed_script="" b
+        for b in "/" " " $'\t' '"' "'" "<" ">" "(" ")" "[" "]" "," ";" ":"; do
+            sed_script+="s|${o}${b}|${n}${b}|g;"
+        done
+        sed_script+="s|${o}$|${n}|g"
+        tmp=$(mktemp -- "${file}.XXXXXX")
+        if sed "${sed_script}" "$file" > "$tmp"; then
             chmod --reference="$file" "$tmp" 2> /dev/null || true
             if mv "$tmp" "$file"; then
                 log_info "rewrote path in: $file"
@@ -1400,7 +1477,12 @@ rewrite_shebang() {
     esc_old="${esc_old//\*/\\*}"
     esc_old="${esc_old//\?/\\?}"
     esc_old="${esc_old//\[/\\[}"
-    local nl="${first//$esc_old/$new}"
+    local nl=""
+    if $HAVE_PERL; then
+        nl=$(OLD="$old" NEW="$new" perl -pe 's/\Q$ENV{OLD}\E(?=[\/\s"\x27<>()[\]{}:,;]|$)/$ENV{NEW}/g' <<< "$first")
+    else
+        nl="${first//$esc_old/$new}"
+    fi
 
     if $DRY_RUN; then
         log_test "would rewrite shebang in: $file"
@@ -1427,6 +1509,9 @@ rewrite_shebang() {
 }
 
 # Execute path rewriting across the venv.
+if [[ -n "$ORIGINAL_PATH" && "$HAVE_PERL" != true ]]; then
+    log_warn "perl not found; path-boundary safety is reduced"
+fi
 if [[ -n "$ORIGINAL_PATH" ]]; then
     for f in activate activate.csh activate.fish Activate.ps1; do
         rewrite_path "$VENV_PATH/bin/$f" "$ORIGINAL_PATH" "$NEW_PATH"
@@ -1496,7 +1581,7 @@ if [[ -d "$EMBED_DIR/lib/python$PYVER" ]]; then
                 esc_home="${desired_home//\\/\\\\}"
                 esc_home="${esc_home//&/\\&}"
                 esc_home="${esc_home//|/\\|}"
-                tmp=$(mktemp "${VENV_PATH}/pyvenv.cfg.XXXXXX")
+                tmp=$(mktemp -- "${VENV_PATH}/pyvenv.cfg.XXXXXX")
                 if sed "s|^[[:space:]]*home[[:space:]]*=.*|home = $esc_home|" \
                     "$VENV_PATH/pyvenv.cfg" > "$tmp"; then
                     chmod --reference="$VENV_PATH/pyvenv.cfg" "$tmp" 2> /dev/null || true
@@ -1775,6 +1860,12 @@ tail -n +\$((PAYLOAD_LINE + 1)) "\$SELF" > "\$TMPDIR/venv.tar.gz"
         log_err "remove \$DEST/\$VENV_BASENAME and run this again."
         exit 2
     fi
+
+actual_top="\$(tar -tzf "\$TMPDIR/venv.tar.gz" 2>/dev/null | sed -n 's|/.*||p' | sort -u | sed -n '1p')"
+if [[ -z "\$actual_top" || "\$actual_top" != "\$VENV_BASENAME" ]]; then
+    log_err "archive top-level directory is '\${actual_top:-<none>}', expected '\$VENV_BASENAME'"
+    exit 2
+fi
 
 if [[ ! -d "\$DEST/\$VENV_BASENAME" ]]; then
     log_err "expected \$DEST/\$VENV_BASENAME after extraction but it is missing"

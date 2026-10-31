@@ -225,6 +225,52 @@ run_installer() {
     exit 2
 }
 
+# ------------------------------------------------------------------------------
+section "edge cases"
+
+mkdir -p "$WORKDIR/edge/src" "$WORKDIR/edge/dst"
+mkvenv "$WORKDIR/edge/src/my venv"
+cp -a "$WORKDIR/edge/src/my venv" "$WORKDIR/edge/dst/my venv"
+capture venv -n "$WORKDIR/edge/final/my venv" -t "$WORKDIR/edge/dst/my venv"
+says "spaced venv path is detected" "original venv:"
+says_not "spaced venv path does not warn" "could not detect original venv path"
+
+mkvenv "$WORKDIR/edge/prefix_src"
+printf '%s/bin/python\n%s_backup/bin/python\n' \
+    "$WORKDIR/edge/prefix_src" "$WORKDIR/edge/prefix_src" \
+    > "$WORKDIR/edge/prefix_src/lib/preserve.pth"
+mkdir -p "$WORKDIR/edge/prefix_moved"
+cp -a "$WORKDIR/edge/prefix_src/." "$WORKDIR/edge/prefix_moved/"
+ran_ok "prefix rewrite runs" venv -n "$WORKDIR/edge/prefix_dst" "$WORKDIR/edge/prefix_moved"
+cond "prefix replacement happens" grep -q "$WORKDIR/edge/prefix_dst/bin/python"     "$WORKDIR/edge/prefix_moved/lib/preserve.pth"
+cond "sibling prefix is preserved" grep -q "$WORKDIR/edge/prefix_src_backup/bin/python"     "$WORKDIR/edge/prefix_moved/lib/preserve.pth"
+
+mkdir -p "$WORKDIR/edge/bin_nold"
+find /usr/bin -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null | \
+    while IFS= read -r -d '' c; do
+        n="$(basename "$c")"
+        [[ "$n" == "ldd" ]] && continue
+        ln -sf "$c" "$WORKDIR/edge/bin_nold/$n"
+    done
+mkvenv "$WORKDIR/edge/ldd_src"
+OUT="$(PATH="$WORKDIR/edge/bin_nold" /bin/bash "$SUT" --bundle-runtime -t "$WORKDIR/edge/ldd_src" 2>&1)"
+if [[ "$OUT" == *"ldd not found; dynamic dependency scanning is unavailable"* ]]; then
+    PASSED=$((PASSED + 1))
+    $QUIET || printf '  %sPASS%s %s\n' "$GREEN" "$RESET" "missing ldd warns"
+else
+    FAILED=$((FAILED + 1))
+    printf '  %sFAIL%s %s\n' "$RED" "$RESET" "missing ldd warns"
+    printf '        wanted ldd warning in: %s\n' "${OUT:-(no output)}"
+fi
+
+mkvenv "$WORKDIR/edge/reembed_src"
+ran_ok "initial embed runs" venv --embed -q "$WORKDIR/edge/reembed_src"
+pydir="$(find "$WORKDIR/edge/reembed_src/.python/lib" -maxdepth 1 -type d -name 'python*' | head -n1)"
+rm -f "$pydir/os.py"
+cond "embedded python can be damaged" test ! -f "$pydir/os.py"
+ran_ok "re-embed runs" venv --re-embed -q "$WORKDIR/edge/reembed_src"
+cond "re-embed restores os.py" test -f "$pydir/os.py"
+
 # ==============================================================================
 note ""
 $QUIET || printf '%b%btest_bundle_venv.sh%b\n' "$BOLD" "$CYAN" "$RESET"
