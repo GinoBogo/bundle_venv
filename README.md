@@ -5,11 +5,10 @@ Relocate and self-contain a Python virtual environment created with
 
 `bundle_venv.sh` makes a Python environment deployable to machines without
 internet access or to secured, locked-down machines by embedding the
-interpreter and its dependencies.
- It
-rewrites internal paths, embeds the base Python, bundles non-system shared
-library dependencies, and can build a tarball or a single-file
-self-extracting installer. It is a Bash script for Linux.
+interpreter and its dependencies. It rewrites internal paths, embeds the
+base Python, bundles non-system shared library dependencies, and can build
+a tarball or a single-file self-extracting installer. It is a Bash script
+for Linux.
 
 ## Features
 
@@ -117,7 +116,8 @@ Regression tests are in `tests/test_bundle_venv.sh`.
 bash tests/test_bundle_venv.sh
 ```
 
-They expect a `tools/` directory layout.
+They locate `bundle_venv.sh` automatically and adapt to the repository
+layout.
 
 ## Author
 

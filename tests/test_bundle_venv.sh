@@ -29,8 +29,41 @@ while [[ -L "$SOURCE" ]]; do
     [[ "$SOURCE" == /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
-SUT="$REPO_ROOT/tools/bundle_venv.sh"
+
+# Locate bundle_venv.sh on our own, regardless of where this test or the
+# script live inside the repository layout (root, tools/, ...).
+SUT=""
+for candidate in "$SCRIPT_DIR/../bundle_venv.sh" "$SCRIPT_DIR/bundle_venv.sh"; do
+    if [[ -f "$candidate" ]]; then
+        SUT="$(cd -P "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+        break
+    fi
+done
+if [[ -z "$SUT" ]]; then
+    d="$SCRIPT_DIR"
+    while [[ "$d" != "/" ]]; do
+        for candidate in "$d/bundle_venv.sh" "$d/tools/bundle_venv.sh"; do
+            if [[ -f "$candidate" ]]; then
+                SUT="$(cd -P "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+                break 2
+            fi
+        done
+        d="$(dirname "$d")"
+    done
+fi
+
+[[ -f "$SUT" ]] || {
+    printf 'cannot find bundle_venv.sh (searched from %s)\n' "$SCRIPT_DIR" >&2
+    exit 2
+}
+
+# Repository root is the SUT directory, or its parent when the SUT lives in tools/.
+SUT_DIR="$(dirname "$SUT")"
+if [[ "$(basename "$SUT_DIR")" == "tools" ]]; then
+    REPO_ROOT="$(cd -P "$SUT_DIR/.." && pwd)"
+else
+    REPO_ROOT="$SUT_DIR"
+fi
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
