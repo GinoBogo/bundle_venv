@@ -119,6 +119,19 @@ bash tests/test_bundle_venv.sh
 They locate `bundle_venv.sh` automatically and adapt to the repository
 layout.
 
+## Disclaimer
+
+This project is provided "as is", without warranty of any kind. It modifies a
+virtual environment in place, including rewriting paths, embedding Python,
+changing ELF rpaths, copying shared libraries, and (optionally) generating
+archives or installers.
+
+Before using it in production, back up your venv and verify the result in the
+target environment. Bundled libraries may still depend on compatible system
+components (for example glibc, the runtime loader, and, unless explicitly
+included, newer libstdc++ ABIs). The authors are not responsible for data loss,
+breakage, or compatibility issues caused by running or transporting the output.
+
 ## Author
 
 Gino Bogo
